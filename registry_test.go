@@ -338,6 +338,7 @@ func TestConcurrentRegistryAccess(t *testing.T) {
 	signalChan := make(chan struct{})
 
 	var wg sync.WaitGroup
+	errs := make(chan string, 10)
 	for i := 0; i < 10; i++ {
 		wg.Add(1)
 		go func(dowork chan struct{}) {
@@ -345,16 +346,22 @@ func TestConcurrentRegistryAccess(t *testing.T) {
 			iface := r.GetOrRegister("foo", counter)
 			retCounter, ok := iface.(Counter)
 			if !ok {
-				t.Fatal("Expected a Counter type")
+				errs <- "Expected a Counter type"
+				return
 			}
 			if retCounter != counter {
-				t.Fatal("Counter references don't match")
+				errs <- "Counter references don't match"
+				return
 			}
 		}(signalChan)
 	}
 
 	close(signalChan) // Closing will cause all go routines to execute at the same time
 	wg.Wait()         // Wait for all go routines to do their work
+	close(errs)
+	for msg := range errs {
+		t.Error(msg)
+	}
 
 	// At the end of the test we should still only have a single "foo" Counter
 	i := 0

@@ -57,6 +57,28 @@ t.Time(func() {})
 t.Update(47)
 ```
 
+For quantiles over a fixed time window ("the last minute") use
+`TimeWindowSample`. It keeps a capped ring of fixed-width time buckets and
+answers any window that fits the retained span:
+
+```go
+// 60 one-second buckets => retains the last minute.
+s := metrics.NewTimeWindowSample(time.Second, 60)
+h := metrics.NewHistogram(s)
+h.Update(latencyMs)
+
+p99LastMinute := s.WindowPercentile(time.Minute, 0.99)
+p95Last10s := s.WindowPercentile(10*time.Second, 0.95)
+```
+
+Only the most recent `bucketCount` buckets exist, so memory does not grow with
+process uptime. Rotation is lazy and constant time on the write path (no
+background goroutine, no global stop-the-world copy), and window queries
+aggregate bucket by bucket. `TimeWindowSample` implements `metrics.Sample`, so
+it plugs into `NewHistogram`/`NewTimer`; its plain `Percentile` covers the
+whole retained span. Deterministic tests can backfill with `UpdateAt` or
+replace the clock with `WithClock`.
+
 **NOTE:** Be sure to unregister short-lived meters and timers otherwise they will
 leak memory:
 
