@@ -3,8 +3,10 @@ package metrics
 import (
 	"math"
 	"math/rand"
+	"runtime"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -34,6 +36,12 @@ type Sample interface {
 // Decay Model for Streaming Systems".
 //
 // <http://dimacs.rutgers.edu/~graham/pubs/papers/fwddecay.pdf>
+//
+// The single reservoir is used while writes are uncontended.  If concurrent
+// writers collide, the sample escalates once to a fixed set of independent
+// shards whose capacities add up to the configured reservoir size.  Writers
+// then touch only one shard and readers merge the shards, so the write path no
+// longer has a process-wide sampling lock.
 type ExpDecaySample struct {
 	alpha         float64
 	count         int64
@@ -41,6 +49,15 @@ type ExpDecaySample struct {
 	reservoirSize int
 	t0, t1        time.Time
 	values        *expDecaySampleHeap
+
+	escalateMutex sync.Mutex
+	epoch         int64
+	generation    int64
+	blockSeq      uint64
+	sharded       int32
+	clearing      int32
+	shards        []*expDecaySampleShard
+	pickerPool    sync.Pool
 }
 
 // NewExpDecaySample constructs a new exponentially-decaying sample with the
@@ -61,20 +78,38 @@ func NewExpDecaySample(reservoirSize int, alpha float64) Sample {
 
 // Clear clears all samples.
 func (s *ExpDecaySample) Clear() {
+	s.escalateMutex.Lock()
+	defer s.escalateMutex.Unlock()
+
+	atomic.StoreInt32(&s.clearing, 1)
+	atomic.AddInt64(&s.generation, 1)
+	epoch := atomic.AddInt64(&s.epoch, 1)
+
 	s.mutex.Lock()
-	defer s.mutex.Unlock()
 	s.count = 0
 	s.t0 = time.Now()
 	s.t1 = s.t0.Add(rescaleThreshold)
+	t0, t1 := s.t0, s.t1
 	s.values.Clear()
+	s.mutex.Unlock()
+
+	for _, shard := range s.shards {
+		shard.mutex.Lock()
+		shard.epoch = epoch
+		shard.count = 0
+		shard.t0 = t0
+		shard.t1 = t1
+		shard.values.Clear()
+		shard.mutex.Unlock()
+	}
+	atomic.StoreInt32(&s.clearing, 0)
 }
 
 // Count returns the number of samples recorded, which may exceed the
 // reservoir size.
 func (s *ExpDecaySample) Count() int64 {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-	return s.count
+	count, _ := s.snapshot()
+	return count
 }
 
 // Max returns the maximum value in the sample, which may not be the maximum
@@ -107,22 +142,15 @@ func (s *ExpDecaySample) Percentiles(ps []float64) []float64 {
 
 // Size returns the size of the sample, which is at most the reservoir size.
 func (s *ExpDecaySample) Size() int {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-	return s.values.Size()
+	_, values := s.snapshot()
+	return len(values)
 }
 
 // Snapshot returns a read-only copy of the sample.
 func (s *ExpDecaySample) Snapshot() Sample {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-	vals := s.values.Values()
-	values := make([]int64, len(vals))
-	for i, v := range vals {
-		values[i] = v.v
-	}
+	count, values := s.snapshot()
 	return &SampleSnapshot{
-		count:  s.count,
+		count:  count,
 		values: values,
 	}
 }
@@ -139,18 +167,43 @@ func (s *ExpDecaySample) Sum() int64 {
 
 // Update samples a new value.
 func (s *ExpDecaySample) Update(v int64) {
-	s.update(time.Now(), v)
+	s.updateAt(time.Now(), v)
+}
+
+// update samples a new value at a particular timestamp.  This is a method all
+// its own to facilitate testing.
+func (s *ExpDecaySample) update(t time.Time, v int64) {
+	s.updateAt(t, v)
+}
+
+func (s *ExpDecaySample) updateAt(t time.Time, v int64) {
+	generation := atomic.LoadInt64(&s.generation)
+	if atomic.LoadInt32(&s.sharded) != 0 {
+		s.updateSharded(t, v, generation)
+		return
+	}
+	if s.mutex.TryLock() {
+		if atomic.LoadInt32(&s.sharded) != 0 {
+			s.mutex.Unlock()
+			s.updateSharded(t, v, generation)
+			return
+		}
+		if atomic.LoadInt64(&s.generation) != generation || atomic.LoadInt32(&s.clearing) != 0 {
+			s.mutex.Unlock()
+			return
+		}
+		s.updateLocked(t, v)
+		s.mutex.Unlock()
+		return
+	}
+
+	s.escalate()
+	s.updateSharded(t, v, generation)
 }
 
 // Values returns a copy of the values in the sample.
 func (s *ExpDecaySample) Values() []int64 {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-	vals := s.values.Values()
-	values := make([]int64, len(vals))
-	for i, v := range vals {
-		values[i] = v.v
-	}
+	_, values := s.snapshot()
 	return values
 }
 
@@ -159,11 +212,7 @@ func (s *ExpDecaySample) Variance() float64 {
 	return SampleVariance(s.Values())
 }
 
-// update samples a new value at a particular timestamp.  This is a method all
-// its own to facilitate testing.
-func (s *ExpDecaySample) update(t time.Time, v int64) {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
+func (s *ExpDecaySample) updateLocked(t time.Time, v int64) {
 	s.count++
 	if s.values.Size() == s.reservoirSize {
 		s.values.Pop()
@@ -180,6 +229,142 @@ func (s *ExpDecaySample) update(t time.Time, v int64) {
 		s.t1 = s.t0.Add(rescaleThreshold)
 		for _, v := range values {
 			v.k = v.k * math.Exp(-s.alpha*s.t0.Sub(t0).Seconds())
+			s.values.Push(v)
+		}
+	}
+}
+
+func (s *ExpDecaySample) updateSharded(t time.Time, v int64, generation int64) {
+	if atomic.LoadInt32(&s.clearing) != 0 {
+		return
+	}
+	epoch := atomic.LoadInt64(&s.epoch)
+	shard := s.shards[nextShardIndex(&s.pickerPool, &s.blockSeq, len(s.shards))]
+	shard.mutex.Lock()
+	if shard.epoch != epoch || atomic.LoadInt32(&s.clearing) != 0 || atomic.LoadInt64(&s.generation) != generation {
+		shard.mutex.Unlock()
+		return
+	}
+	shard.count++
+	shard.addLocked(t, v, s.alpha)
+	shard.mutex.Unlock()
+}
+
+// escalate converts the sample to a fixed set of independent reservoirs.  It
+// runs once, after two writers collide on the single-reservoir fast path.  The
+// existing reservoir is split across the shards so memory remains bounded by
+// the configured reservoir size.
+func (s *ExpDecaySample) escalate() {
+	s.escalateMutex.Lock()
+	defer s.escalateMutex.Unlock()
+	if atomic.LoadInt32(&s.sharded) != 0 {
+		return
+	}
+
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+
+	n := shardCountFor(s.reservoirSize)
+	epoch := atomic.LoadInt64(&s.epoch) + 1
+	legacy := s.values.Values()
+	shards := make([]*expDecaySampleShard, n)
+	for i := range shards {
+		shards[i] = &expDecaySampleShard{
+			epoch:         epoch,
+			reservoirSize: shardCapacity(s.reservoirSize, n, i),
+			t0:            s.t0,
+			t1:            s.t1,
+			values:        newExpDecaySampleHeap(shardCapacity(s.reservoirSize, n, i)),
+			rng:           shardRand(mix64(uint64(i)+1) ^ uint64(time.Now().UnixNano())),
+		}
+	}
+
+	seq := uint64(0)
+	for _, value := range legacy {
+		shard := shards[shardIndex(n, seq)]
+		seq++
+		shard.mutex.Lock()
+		if shard.values.Size() == shard.reservoirSize {
+			shard.values.Pop()
+		}
+		shard.values.Push(value)
+		shard.mutex.Unlock()
+	}
+
+	s.values.Clear()
+	s.shards = shards
+	atomic.StoreUint64(&s.blockSeq, seq)
+	for i := 0; i < n; i++ {
+		s.pickerPool.Put(new(shardPicker))
+	}
+	atomic.StoreInt64(&s.epoch, epoch)
+	atomic.StoreInt32(&s.sharded, 1)
+}
+
+func (s *ExpDecaySample) snapshot() (int64, []int64) {
+	for {
+		generation := atomic.LoadInt64(&s.generation)
+		if atomic.LoadInt32(&s.clearing) != 0 {
+			runtime.Gosched()
+			continue
+		}
+		epoch := atomic.LoadInt64(&s.epoch)
+
+		s.mutex.Lock()
+		values := make([]int64, 0, s.values.Size()+s.reservoirSize)
+		for _, value := range s.values.Values() {
+			values = append(values, value.v)
+		}
+		count := s.count
+		s.mutex.Unlock()
+
+		if atomic.LoadInt32(&s.sharded) != 0 {
+			for _, shard := range s.shards {
+				shard.mutex.Lock()
+				if shard.epoch == epoch {
+					count += shard.count
+					for _, value := range shard.values.Values() {
+						values = append(values, value.v)
+					}
+				}
+				shard.mutex.Unlock()
+			}
+		}
+
+		if atomic.LoadInt32(&s.clearing) == 0 &&
+			atomic.LoadInt64(&s.generation) == generation &&
+			atomic.LoadInt64(&s.epoch) == epoch {
+			return count, values
+		}
+	}
+}
+
+type expDecaySampleShard struct {
+	mutex         sync.Mutex
+	epoch         int64
+	count         int64
+	reservoirSize int
+	t0, t1        time.Time
+	values        *expDecaySampleHeap
+	rng           shardRand
+}
+
+func (s *expDecaySampleShard) addLocked(t time.Time, v int64, alpha float64) {
+	if s.values.Size() == s.reservoirSize {
+		s.values.Pop()
+	}
+	s.values.Push(expDecaySample{
+		k: math.Exp(t.Sub(s.t0).Seconds()*alpha) / s.rng.float64(),
+		v: v,
+	})
+	if t.After(s.t1) {
+		values := s.values.Values()
+		t0 := s.t0
+		s.values.Clear()
+		s.t0 = t
+		s.t1 = s.t0.Add(rescaleThreshold)
+		for _, v := range values {
+			v.k = v.k * math.Exp(-alpha*s.t0.Sub(t0).Seconds())
 			s.values.Push(v)
 		}
 	}
@@ -397,11 +582,23 @@ func SampleVariance(values []int64) float64 {
 // A uniform sample using Vitter's Algorithm R.
 //
 // <http://www.cs.umd.edu/~samir/498/vitter.pdf>
+//
+// Like ExpDecaySample, concurrent writers are moved onto a fixed set of
+// bounded shards and readers merge those shards.
 type UniformSample struct {
 	count         int64
 	mutex         sync.Mutex
 	reservoirSize int
 	values        []int64
+
+	escalateMutex sync.Mutex
+	epoch         int64
+	generation    int64
+	blockSeq      uint64
+	sharded       int32
+	clearing      int32
+	shards        []*uniformSampleShard
+	pickerPool    sync.Pool
 }
 
 // NewUniformSample constructs a new uniform sample with the given reservoir
@@ -418,95 +615,116 @@ func NewUniformSample(reservoirSize int) Sample {
 
 // Clear clears all samples.
 func (s *UniformSample) Clear() {
+	s.escalateMutex.Lock()
+	defer s.escalateMutex.Unlock()
+
+	atomic.StoreInt32(&s.clearing, 1)
+	atomic.AddInt64(&s.generation, 1)
+	epoch := atomic.AddInt64(&s.epoch, 1)
+
 	s.mutex.Lock()
-	defer s.mutex.Unlock()
 	s.count = 0
 	s.values = make([]int64, 0, s.reservoirSize)
+	s.mutex.Unlock()
+
+	for _, shard := range s.shards {
+		shard.mutex.Lock()
+		shard.epoch = epoch
+		shard.count = 0
+		shard.seen = 0
+		shard.values = shard.values[:0]
+		shard.mutex.Unlock()
+	}
+	atomic.StoreInt32(&s.clearing, 0)
 }
 
 // Count returns the number of samples recorded, which may exceed the
 // reservoir size.
 func (s *UniformSample) Count() int64 {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-	return s.count
+	count, _ := s.snapshot()
+	return count
 }
 
 // Max returns the maximum value in the sample, which may not be the maximum
 // value ever to be part of the sample.
 func (s *UniformSample) Max() int64 {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-	return SampleMax(s.values)
+	return SampleMax(s.Values())
 }
 
 // Mean returns the mean of the values in the sample.
 func (s *UniformSample) Mean() float64 {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-	return SampleMean(s.values)
+	return SampleMean(s.Values())
 }
 
 // Min returns the minimum value in the sample, which may not be the minimum
 // value ever to be part of the sample.
 func (s *UniformSample) Min() int64 {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-	return SampleMin(s.values)
+	return SampleMin(s.Values())
 }
 
 // Percentile returns an arbitrary percentile of values in the sample.
 func (s *UniformSample) Percentile(p float64) float64 {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-	return SamplePercentile(s.values, p)
+	return SamplePercentile(s.Values(), p)
 }
 
 // Percentiles returns a slice of arbitrary percentiles of values in the
 // sample.
 func (s *UniformSample) Percentiles(ps []float64) []float64 {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-	return SamplePercentiles(s.values, ps)
+	return SamplePercentiles(s.Values(), ps)
 }
 
 // Size returns the size of the sample, which is at most the reservoir size.
 func (s *UniformSample) Size() int {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-	return len(s.values)
+	_, values := s.snapshot()
+	return len(values)
 }
 
 // Snapshot returns a read-only copy of the sample.
 func (s *UniformSample) Snapshot() Sample {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-	values := make([]int64, len(s.values))
-	copy(values, s.values)
+	count, values := s.snapshot()
 	return &SampleSnapshot{
-		count:  s.count,
+		count:  count,
 		values: values,
 	}
 }
 
 // StdDev returns the standard deviation of the values in the sample.
 func (s *UniformSample) StdDev() float64 {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-	return SampleStdDev(s.values)
+	return SampleStdDev(s.Values())
 }
 
 // Sum returns the sum of the values in the sample.
 func (s *UniformSample) Sum() int64 {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-	return SampleSum(s.values)
+	return SampleSum(s.Values())
 }
 
 // Update samples a new value.
 func (s *UniformSample) Update(v int64) {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
+	generation := atomic.LoadInt64(&s.generation)
+	if atomic.LoadInt32(&s.sharded) != 0 {
+		s.updateSharded(v, generation)
+		return
+	}
+	if s.mutex.TryLock() {
+		if atomic.LoadInt32(&s.sharded) != 0 {
+			s.mutex.Unlock()
+			s.updateSharded(v, generation)
+			return
+		}
+		if atomic.LoadInt64(&s.generation) != generation || atomic.LoadInt32(&s.clearing) != 0 {
+			s.mutex.Unlock()
+			return
+		}
+		s.updateLocked(v)
+		s.mutex.Unlock()
+		return
+	}
+
+	s.escalate()
+	s.updateSharded(v, generation)
+}
+
+func (s *UniformSample) updateLocked(v int64) {
 	s.count++
 	if len(s.values) < s.reservoirSize {
 		s.values = append(s.values, v)
@@ -518,20 +736,230 @@ func (s *UniformSample) Update(v int64) {
 	}
 }
 
-// Values returns a copy of the values in the sample.
-func (s *UniformSample) Values() []int64 {
+func (s *UniformSample) updateSharded(v int64, generation int64) {
+	if atomic.LoadInt32(&s.clearing) != 0 {
+		return
+	}
+	epoch := atomic.LoadInt64(&s.epoch)
+	shard := s.shards[nextShardIndex(&s.pickerPool, &s.blockSeq, len(s.shards))]
+	shard.mutex.Lock()
+	if shard.epoch != epoch || atomic.LoadInt32(&s.clearing) != 0 || atomic.LoadInt64(&s.generation) != generation {
+		shard.mutex.Unlock()
+		return
+	}
+	shard.addLocked(v, true)
+	shard.mutex.Unlock()
+}
+
+func (s *UniformSample) escalate() {
+	s.escalateMutex.Lock()
+	defer s.escalateMutex.Unlock()
+	if atomic.LoadInt32(&s.sharded) != 0 {
+		return
+	}
+
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
-	values := make([]int64, len(s.values))
-	copy(values, s.values)
+
+	n := shardCountFor(s.reservoirSize)
+	epoch := atomic.LoadInt64(&s.epoch) + 1
+	shards := make([]*uniformSampleShard, n)
+	for i := range shards {
+		shards[i] = &uniformSampleShard{
+			epoch:         epoch,
+			reservoirSize: shardCapacity(s.reservoirSize, n, i),
+			values:        make([]int64, 0, shardCapacity(s.reservoirSize, n, i)),
+			rng:           shardRand(mix64(uint64(i)+1) ^ uint64(time.Now().UnixNano())),
+		}
+	}
+
+	seq := uint64(0)
+	for _, value := range s.values {
+		shard := shards[shardIndex(n, seq)]
+		seq++
+		shard.mutex.Lock()
+		shard.addLocked(value, false)
+		shard.mutex.Unlock()
+	}
+	oldCount := s.count
+	for i, shard := range shards {
+		weighted := oldCount / int64(n)
+		if int64(i) < oldCount%int64(n) {
+			weighted++
+		}
+		if shard.seen < weighted {
+			shard.seen = weighted
+		}
+	}
+
+	s.values = make([]int64, 0, s.reservoirSize)
+	s.shards = shards
+	atomic.StoreUint64(&s.blockSeq, seq)
+	for i := 0; i < n; i++ {
+		s.pickerPool.Put(new(shardPicker))
+	}
+	atomic.StoreInt64(&s.epoch, epoch)
+	atomic.StoreInt32(&s.sharded, 1)
+}
+
+func (s *UniformSample) snapshot() (int64, []int64) {
+	for {
+		generation := atomic.LoadInt64(&s.generation)
+		if atomic.LoadInt32(&s.clearing) != 0 {
+			runtime.Gosched()
+			continue
+		}
+		epoch := atomic.LoadInt64(&s.epoch)
+
+		s.mutex.Lock()
+		values := make([]int64, 0, len(s.values)+s.reservoirSize)
+		values = append(values, s.values...)
+		count := s.count
+		s.mutex.Unlock()
+
+		if atomic.LoadInt32(&s.sharded) != 0 {
+			for _, shard := range s.shards {
+				shard.mutex.Lock()
+				if shard.epoch == epoch {
+					count += shard.count
+					values = append(values, shard.values...)
+				}
+				shard.mutex.Unlock()
+			}
+		}
+
+		if atomic.LoadInt32(&s.clearing) == 0 &&
+			atomic.LoadInt64(&s.generation) == generation &&
+			atomic.LoadInt64(&s.epoch) == epoch {
+			return count, values
+		}
+	}
+}
+
+type uniformSampleShard struct {
+	mutex         sync.Mutex
+	epoch         int64
+	count         int64
+	seen          int64
+	reservoirSize int
+	values        []int64
+	rng           shardRand
+}
+
+func (s *uniformSampleShard) addLocked(v int64, record bool) {
+	s.seen++
+	if record {
+		s.count++
+	}
+	if len(s.values) < s.reservoirSize {
+		s.values = append(s.values, v)
+	} else {
+		r := s.rng.int63n(s.seen)
+		if r < int64(len(s.values)) {
+			s.values[int(r)] = v
+		}
+	}
+}
+
+// Values returns a copy of the values in the sample.
+func (s *UniformSample) Values() []int64 {
+	_, values := s.snapshot()
 	return values
 }
 
 // Variance returns the variance of the values in the sample.
 func (s *UniformSample) Variance() float64 {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-	return SampleVariance(s.values)
+	return SampleVariance(s.Values())
+}
+
+// shardCountFor bounds the number of write shards by both the reservoir size
+// and the amount of parallelism available.  A power of two keeps shard
+// selection to an add and a mask.
+func shardCountFor(reservoirSize int) int {
+	n := 32
+	if p := runtime.GOMAXPROCS(0) * 2; p > n {
+		n = p
+	}
+	if n > 256 {
+		n = 256
+	}
+	if reservoirSize < n {
+		n = reservoirSize
+	}
+	if n < 1 {
+		return 1
+	}
+	power := 1
+	for power*2 <= n {
+		power *= 2
+	}
+	return power
+}
+
+func shardCapacity(reservoirSize, shards, i int) int {
+	capacity := reservoirSize / shards
+	if i < reservoirSize%shards {
+		capacity++
+	}
+	if capacity < 1 {
+		capacity = 1
+	}
+	return capacity
+}
+
+// shardIndex assigns consecutive updates in blocks of n.  Every block visits
+// each shard exactly once, but the block's phase is randomized so a periodic
+// input pattern cannot repeatedly hit only one shard.
+func shardIndex(n int, seq uint64) int {
+	if n <= 1 {
+		return 0
+	}
+	offset := mix64(seq / uint64(n))
+	return int((seq + offset) & uint64(n-1))
+}
+
+type shardPicker struct {
+	next      uint64
+	remaining int
+}
+
+func nextShardIndex(pool *sync.Pool, blockSeq *uint64, n int) int {
+	picker, _ := pool.Get().(*shardPicker)
+	if picker == nil {
+		return shardIndex(n, mix64(uint64(time.Now().UnixNano())))
+	}
+	if picker.remaining == 0 {
+		picker.next = atomic.AddUint64(blockSeq, uint64(n)) - uint64(n)
+		picker.remaining = n
+	}
+	seq := picker.next
+	picker.next++
+	picker.remaining--
+	index := shardIndex(n, seq)
+	pool.Put(picker)
+	return index
+}
+
+func mix64(x uint64) uint64 {
+	x += 0x9e3779b97f4a7c15
+	x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9
+	x = (x ^ (x >> 27)) * 0x94d049bb133111eb
+	return x ^ (x >> 31)
+}
+
+type shardRand uint64
+
+func (r *shardRand) uint64() uint64 {
+	*r += 0x9e3779b97f4a7c15
+	return mix64(uint64(*r))
+}
+
+func (r *shardRand) float64() float64 {
+	return float64((r.uint64()>>11)+1) / float64(uint64(1)<<53)
+}
+
+func (r *shardRand) int63n(n int64) int64 {
+	return int64(r.uint64() % uint64(n))
 }
 
 // expDecaySample represents an individual sample in a heap.
