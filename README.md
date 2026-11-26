@@ -57,6 +57,26 @@ t.Time(func() {})
 t.Update(47)
 ```
 
+For high-cardinality names (user IDs, paths or error text), use a bounded,
+lock-sharded registry:
+
+```go
+r := metrics.NewBoundedRegistry(10000, 10*time.Minute)
+defer r.Close()
+
+counter := metrics.GetOrRegisterCounter("requests.by-user", r)
+counter.Inc(1)
+```
+
+The registry never stores more than `10000` metrics and evicts the least
+recently updated entry when space is needed; entries idle for longer than the
+TTL are also swept. A counter handle returned by the registry re-registers
+itself on its next write after capacity/idle eviction, preserving its value.
+Use `BoundedRegistryConfig{StrictEvictedWrites: true}` when writes to an
+evicted handle should return/wrap `ErrMetricEvicted` (`IncE`/`Add`) or panic
+through the compatibility `Inc` method instead. Registration and lookup use
+per-name-hash shard locks rather than one global lock.
+
 **NOTE:** Be sure to unregister short-lived meters and timers otherwise they will
 leak memory:
 

@@ -125,6 +125,10 @@ func (r *StandardRegistry) RunHealthchecks() {
 
 // GetAll metrics in the Registry
 func (r *StandardRegistry) GetAll() map[string]map[string]interface{} {
+	return getAllMetrics(r)
+}
+
+func getAllMetrics(r Registry) map[string]map[string]interface{} {
 	data := make(map[string]map[string]interface{})
 	r.Each(func(name string, i interface{}) {
 		values := make(map[string]interface{})
@@ -284,6 +288,8 @@ func findPrefix(registry Registry, prefix string) (Registry, string) {
 	case *PrefixedRegistry:
 		return findPrefix(r.underlying, r.prefix+prefix)
 	case *StandardRegistry:
+		return r, prefix
+	case *BoundedRegistry:
 		return r, prefix
 	}
 	return nil, ""

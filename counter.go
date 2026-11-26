@@ -11,6 +11,13 @@ type Counter interface {
 	Snapshot() Counter
 }
 
+// WritableCounter is a Counter whose mutation can report a registry
+// eviction or resurrection conflict instead of silently losing the write.
+type WritableCounter interface {
+	Counter
+	Add(int64) error
+}
+
 // GetOrRegisterCounter returns an existing Counter or constructs and registers
 // a new StandardCounter.
 func GetOrRegisterCounter(name string, r Registry) Counter {
@@ -25,7 +32,7 @@ func NewCounter() Counter {
 	if UseNilMetrics {
 		return NilCounter{}
 	}
-	return &StandardCounter{0}
+	return &StandardCounter{}
 }
 
 // NewRegisteredCounter constructs and registers a new StandardCounter.
@@ -84,10 +91,47 @@ func (NilCounter) Snapshot() Counter { return NilCounter{} }
 // sync/atomic package to manage a single int64 value.
 type StandardCounter struct {
 	count int64
+	hook  atomic.Value // counterWriteHook
+}
+
+type counterWriteHook interface {
+	addCounter(*StandardCounter, int64) error
+	clearCounter(*StandardCounter) error
+}
+
+func (c *StandardCounter) writeHook() counterWriteHook {
+	if v := c.hook.Load(); v != nil {
+		return v.(counterWriteHook)
+	}
+	return nil
+}
+
+func (c *StandardCounter) setWriteHook(h counterWriteHook) {
+	if h == nil {
+		h = disabledCounterHook{}
+	}
+	c.hook.Store(h)
+}
+
+// Add adds n to the counter. When the counter is managed by a bounded
+// registry, Add returns an error if the write cannot be re-attached to the
+// registry.
+func (c *StandardCounter) Add(n int64) error {
+	if h := c.writeHook(); h != nil {
+		return h.addCounter(c, n)
+	}
+	atomic.AddInt64(&c.count, n)
+	return nil
 }
 
 // Clear sets the counter to zero.
 func (c *StandardCounter) Clear() {
+	if h := c.writeHook(); h != nil {
+		if err := h.clearCounter(c); err != nil {
+			panic(err)
+		}
+		return
+	}
 	atomic.StoreInt64(&c.count, 0)
 }
 
@@ -98,15 +142,31 @@ func (c *StandardCounter) Count() int64 {
 
 // Dec decrements the counter by the given amount.
 func (c *StandardCounter) Dec(i int64) {
-	atomic.AddInt64(&c.count, -i)
+	if err := c.Add(-i); err != nil {
+		panic(err)
+	}
 }
 
 // Inc increments the counter by the given amount.
 func (c *StandardCounter) Inc(i int64) {
-	atomic.AddInt64(&c.count, i)
+	if err := c.Add(i); err != nil {
+		panic(err)
+	}
 }
 
 // Snapshot returns a read-only copy of the counter.
 func (c *StandardCounter) Snapshot() Counter {
 	return CounterSnapshot(c.Count())
+}
+
+type disabledCounterHook struct{}
+
+func (disabledCounterHook) addCounter(c *StandardCounter, n int64) error {
+	atomic.AddInt64(&c.count, n)
+	return nil
+}
+
+func (disabledCounterHook) clearCounter(c *StandardCounter) error {
+	atomic.StoreInt64(&c.count, 0)
+	return nil
 }
